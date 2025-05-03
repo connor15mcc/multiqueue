@@ -1,44 +1,83 @@
-#[derive(Debug)]
+use indoc::indoc;
+use sqlx::migrate::MigrateDatabase;
+use std::error::Error;
+
+use sqlx::sqlite::{Sqlite, SqlitePool};
+
+const DB_URL: &str = "sqlite://tasks.db";
+
+#[derive(sqlx::FromRow, Debug)]
 struct Task {
-    inner: String,
+    #[allow(dead_code)]
+    name: String,
 }
 
 impl Task {
     fn new(s: &str) -> Self {
         Task {
-            inner: s.to_string(),
+            name: s.to_string(),
         }
     }
 }
 
-struct MultiQueue<T> {
-    vec: Vec<T>,
+struct MultiQueue {
+    pool: SqlitePool,
 }
 
-impl<T> MultiQueue<T> {
-    fn new(vec: Vec<T>) -> Self {
-        MultiQueue { vec }
+impl MultiQueue {
+    async fn new(tasks: Vec<Task>) -> Result<Self, Box<dyn Error>> {
+        if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
+            println!("[TEMP] Creating database..");
+            Sqlite::create_database(DB_URL).await?;
+            println!("[TEMP] Database created!");
+        }
+        let pool = SqlitePool::connect(DB_URL).await.unwrap();
+
+        sqlx::query(indoc! {"
+            CREATE TABLE IF NOT EXISTS tasks (
+                name TEXT NOT NULL PRIMARY KEY
+            )
+        "})
+        .execute(&pool)
+        .await?;
+
+        for task in tasks.iter() {
+            let result = sqlx::query("INSERT OR IGNORE INTO tasks (name) VALUES ($1)")
+                .bind(&task.name)
+                .execute(&pool)
+                .await?;
+            match result.rows_affected() {
+                0 => println!("{:?} already exists in DB", task),
+                1 => println!("{:?} inserted into DB", task),
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(MultiQueue { pool })
     }
 
-    fn get<P>(&mut self, pred: P) -> Option<T>
-    where
-        P: FnMut(&T) -> bool,
-    {
-        let idx = self.vec.iter().position(pred)?;
-        let elt = self.vec.swap_remove(idx);
-        Some(elt)
+    async fn get_by_name(&mut self, name: &str) -> Result<Option<Task>, Box<dyn Error>> {
+        let task: Option<Task> = sqlx::query_as("SELECT name FROM tasks WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(task)
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let a = Task::new("a");
     let b = Task::new("b");
     let c = Task::new("c");
 
-    let mut q = MultiQueue::new(vec![a, b, c]);
+    let mut q = MultiQueue::new(vec![a, b, c]).await.unwrap();
 
-    let task = q.get(|t| t.inner == "a");
-    println!("Got task! {:?}", task);
-    let task = q.get(|t| t.inner == "a");
-    println!("Got task! {:?}", task);
+    let task = q.get_by_name("a").await?;
+    println!("Got: {:?}", task);
+    let task = q.get_by_name("a").await?;
+    println!("Got: {:?}", task);
+
+    Ok(())
 }
