@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use indoc::indoc;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use sqlx::migrate::MigrateDatabase;
 
 use sqlx::sqlite::{Sqlite, SqlitePool};
+use tokio::time::{self, Duration};
 
 const DB_URL: &str = "sqlite://tasks.db";
 
@@ -16,7 +17,8 @@ struct Task {
 
 #[derive(sqlx::Type, Debug)]
 enum TaskState {
-    Pending,
+    Waiting,
+    Queued,
     Complete,
 }
 
@@ -24,11 +26,12 @@ impl Task {
     fn new(s: &str) -> Self {
         Task {
             name: s.to_string(),
-            state: TaskState::Pending,
+            state: TaskState::Waiting,
         }
     }
 }
 
+#[derive(Clone)]
 struct MultiQueue {
     pool: SqlitePool,
 }
@@ -76,10 +79,11 @@ impl MultiQueue {
         Ok(task)
     }
 
-    async fn get_pending(&mut self) -> Result<Vec<Task>> {
+    // WARN: this imposes a limit on result size, it is NOT exhaustive
+    async fn get_by_state(&mut self, state: TaskState) -> Result<Vec<Task>> {
         let pending_limit = 5;
         let pending: Vec<Task> = sqlx::query_as("SELECT * FROM tasks WHERE state = $1 LIMIT $2")
-            .bind(TaskState::Pending)
+            .bind(state)
             .bind(pending_limit)
             .fetch_all(&self.pool)
             .await?;
@@ -98,13 +102,20 @@ impl MultiQueue {
     }
 }
 
-trait Gate {
+trait Gate: Send {
     fn should_proceed(&mut self, task: &Task) -> Result<bool>;
 }
 
-#[derive(Default)]
 struct RandomGate {
-    rng: rand::rngs::ThreadRng,
+    rng: rand::rngs::StdRng,
+}
+
+impl Default for RandomGate {
+    fn default() -> Self {
+        Self {
+            rng: rand::rngs::StdRng::from_os_rng(),
+        }
+    }
 }
 
 impl Gate for RandomGate {
@@ -113,9 +124,16 @@ impl Gate for RandomGate {
     }
 }
 
-#[derive(Default)]
 struct FlakyGate {
-    rng: rand::rngs::ThreadRng,
+    rng: rand::rngs::StdRng,
+}
+
+impl Default for FlakyGate {
+    fn default() -> Self {
+        Self {
+            rng: rand::rngs::StdRng::from_os_rng(),
+        }
+    }
 }
 
 impl Gate for FlakyGate {
@@ -127,72 +145,128 @@ impl Gate for FlakyGate {
     }
 }
 
+struct GateEvaluator {
+    gates: Vec<Box<dyn Gate>>,
+    multiqueue: MultiQueue,
+}
+
+impl GateEvaluator {
+    async fn run(&mut self) -> Result<()> {
+        let mut interval = time::interval(Duration::from_millis(1000));
+        loop {
+            interval.tick().await;
+
+            let waiting = self
+                .multiqueue
+                .get_by_state(TaskState::Waiting)
+                .await
+                .context("couldn't get waiting")?;
+            println!("{} tasks currently waiting", waiting.len());
+
+            let mut to_be_queued = vec![];
+            for task in waiting {
+                let all_gates_proceeding: Result<bool> = self
+                    .gates
+                    .iter_mut()
+                    .map(|gate| gate.should_proceed(&task))
+                    .try_fold(true, |acc: bool, task: Result<bool>| {
+                        let b = task?;
+                        Ok(acc && b)
+                    });
+
+                match all_gates_proceeding {
+                    Ok(true) => {
+                        println!("{} eligible for transition", &task.name);
+                        to_be_queued.push(task);
+                    }
+                    Ok(false) => {
+                        println!(
+                            "{} ineligible for transition: should not proceed",
+                            &task.name,
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} couldn't be evaluted for transition: {:?}",
+                            &task.name, e,
+                        );
+                    }
+                }
+            }
+
+            for task in to_be_queued {
+                self.multiqueue
+                    .transition(&task.name, TaskState::Queued)
+                    .await?;
+                println!("{} enqueued", &task.name);
+            }
+        }
+    }
+}
+
+struct TaskRunner {
+    multiqueue: MultiQueue,
+}
+
+impl TaskRunner {
+    async fn run(&mut self) -> Result<()> {
+        let mut interval = time::interval(Duration::from_millis(1500));
+        loop {
+            interval.tick().await;
+
+            let queued = self
+                .multiqueue
+                .get_by_state(TaskState::Queued)
+                .await
+                .context("couldn't get enqueued")?;
+
+            for task in queued {
+                println!("Task {} is being completed!", &task.name);
+
+                self.multiqueue
+                    .transition(&task.name, TaskState::Complete)
+                    .await?;
+                println!("{} transitioned to complete", &task.name);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let batch_size = 5;
-
     let a = Task::new("a");
     let b = Task::new("b");
     let c = Task::new("c");
 
-    let mut q = MultiQueue::new(vec![a, b, c])
+    let mut multiqueue = MultiQueue::new(vec![a, b, c])
         .await
         .context("failed to create DB")?;
 
-    let task = q.get_by_name("a").await?;
+    let task = multiqueue.get_by_name("a").await?;
     println!("Got: {:#?}", task);
-    let task = q.get_by_name("a").await?;
+    let task = multiqueue.get_by_name("a").await?;
     println!("Got: {:#?}", task);
-    let task = q.get_by_name("c").await?;
+    let task = multiqueue.get_by_name("c").await?;
     println!("Got: {:#?}", task);
 
-    let mut gates: Vec<Box<dyn Gate>> = vec![
+    let gates: Vec<Box<dyn Gate>> = vec![
         Box::new(RandomGate::default()),
         Box::new(FlakyGate::default()),
     ];
-    loop {
-        let pending = q.get_pending().await.context("couldn't get pending")?;
-        println!("Pending: {:#?}", pending);
-        if pending.len() == 0 {
-            break;
-        }
 
-        let mut transitionable = vec![];
-        // WARN: consider the case where all `batch_size` pending tasks are un-transitionable --
-        // will deadlock. could avoid by re-ordering those items to back
-        for task in pending.iter().take(batch_size) {
-            let should_proceed: Result<bool> = gates
-                .iter_mut()
-                .map(|gate| gate.should_proceed(task))
-                .try_fold(true, |acc: bool, task: Result<bool>| {
-                    let b = task?;
-                    Ok(acc && b)
-                });
-            match should_proceed {
-                Ok(true) => {
-                    println!("{} eligible for transition", &task.name);
-                    transitionable.push(task);
-                }
-                Ok(false) => {
-                    println!(
-                        "{} ineligible for transition: should not proceed",
-                        &task.name,
-                    );
-                }
-                Err(e) => {
-                    println!(
-                        "{} couldn't be evaluted for transition: {:?}",
-                        &task.name, e,
-                    );
-                }
-            }
-        }
+    let mut evaluator = GateEvaluator {
+        gates,
+        multiqueue: multiqueue.clone(),
+    };
+    let mut runner = TaskRunner { multiqueue };
 
-        for task in transitionable {
-            q.transition(&task.name, TaskState::Complete).await?;
-            println!("{} transitioned to complete", &task.name);
-        }
-    }
+    let evaluator_handle = tokio::spawn(async move { evaluator.run().await });
+    let runner_handle = tokio::spawn(async move { runner.run().await });
+
+    let (evaluator_result, runner_result) = tokio::join!(evaluator_handle, runner_handle);
+
+    evaluator_result??;
+    runner_result??;
 
     Ok(())
 }
