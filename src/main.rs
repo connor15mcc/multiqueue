@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use indoc::indoc;
 use rand::Rng;
 use sqlx::migrate::MigrateDatabase;
@@ -99,14 +99,31 @@ impl MultiQueue {
 }
 
 trait Gate {
-    fn should_proceed(&self, task: &Task) -> Result<bool>;
+    fn should_proceed(&mut self, task: &Task) -> Result<bool>;
 }
 
-struct Random {}
+#[derive(Default)]
+struct RandomGate {
+    rng: rand::rngs::ThreadRng,
+}
 
-impl Gate for Random {
-    fn should_proceed(&self, _: &Task) -> Result<bool> {
-        Ok(rand::rng().random_bool(1.0 / 2.0))
+impl Gate for RandomGate {
+    fn should_proceed(&mut self, _: &Task) -> Result<bool> {
+        Ok(self.rng.random_bool(1.0 / 2.0))
+    }
+}
+
+#[derive(Default)]
+struct FlakyGate {
+    rng: rand::rngs::ThreadRng,
+}
+
+impl Gate for FlakyGate {
+    fn should_proceed(&mut self, _: &Task) -> Result<bool> {
+        if self.rng.random_bool(1.0 / 5.0) {
+            bail!("oops, looks like I failed!")
+        }
+        Ok(true)
     }
 }
 
@@ -129,7 +146,10 @@ async fn main() -> Result<()> {
     let task = q.get_by_name("c").await?;
     println!("Got: {:#?}", task);
 
-    let gate = Random {};
+    let mut gates: Vec<Box<dyn Gate>> = vec![
+        Box::new(RandomGate::default()),
+        Box::new(FlakyGate::default()),
+    ];
     loop {
         let pending = q.get_pending().await.context("couldn't get pending")?;
         println!("Pending: {:#?}", pending);
@@ -141,7 +161,14 @@ async fn main() -> Result<()> {
         // WARN: consider the case where all `batch_size` pending tasks are un-transitionable --
         // will deadlock. could avoid by re-ordering those items to back
         for task in pending.iter().take(batch_size) {
-            match gate.should_proceed(&task) {
+            let should_proceed: Result<bool> = gates
+                .iter_mut()
+                .map(|gate| gate.should_proceed(task))
+                .try_fold(true, |acc: bool, task: Result<bool>| {
+                    let b = task?;
+                    Ok(acc && b)
+                });
+            match should_proceed {
                 Ok(true) => {
                     println!("{} eligible for transition", &task.name);
                     transitionable.push(task);
