@@ -112,6 +112,8 @@ impl Gate for Random {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let batch_size = 5;
+
     let a = Task::new("a");
     let b = Task::new("b");
     let c = Task::new("c");
@@ -131,13 +133,18 @@ async fn main() -> Result<()> {
     loop {
         let pending = q.get_pending().await.context("couldn't get pending")?;
         println!("Pending: {:#?}", pending);
+        if pending.len() == 0 {
+            break;
+        }
 
-        match pending.first() {
-            None => break,
-            Some(task) => match gate.should_proceed(&task) {
+        let mut transitionable = vec![];
+        // WARN: consider the case where all `batch_size` pending tasks are un-transitionable --
+        // will deadlock. could avoid by re-ordering those items to back
+        for task in pending.iter().take(batch_size) {
+            match gate.should_proceed(&task) {
                 Ok(true) => {
-                    q.transition(&task.name, TaskState::Complete).await?;
-                    println!("{} transitioned to `Complete` state", &task.name);
+                    println!("{} eligible for transition", &task.name);
+                    transitionable.push(task);
                 }
                 Ok(false) => {
                     println!(
@@ -151,7 +158,12 @@ async fn main() -> Result<()> {
                         &task.name, e,
                     );
                 }
-            },
+            }
+        }
+
+        for task in transitionable {
+            q.transition(&task.name, TaskState::Complete).await?;
+            println!("{} transitioned to complete", &task.name);
         }
     }
 
