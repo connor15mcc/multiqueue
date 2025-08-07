@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tokio::time::{self, Duration};
+use tokio::time;
 
 use crate::multiqueue::MultiQueue;
 
@@ -28,11 +28,12 @@ impl Task {
 
 pub struct TaskRunner {
     pub multiqueue: MultiQueue,
+    pub poll_interval: time::Duration,
 }
 
 impl TaskRunner {
     pub async fn run(&mut self) -> Result<()> {
-        let mut interval = time::interval(Duration::from_millis(1500));
+        let mut interval = time::interval(self.poll_interval);
         loop {
             interval.tick().await;
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use indoc::indoc;
 use sqlx::SqlitePool;
 
-use crate::task::*;
+use crate::tasks::*;
 
 #[derive(Clone)]
 pub struct MultiQueue {
@@ -52,6 +52,15 @@ impl MultiQueue {
             .bind(state)
             .bind(pending_limit)
             .fetch_all(&self.pool)
+            .await?;
+
+        Ok(pending)
+    }
+
+    pub async fn count_with_state(&mut self, state: TaskState) -> Result<u64> {
+        let pending: u64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE state = $1")
+            .bind(state)
+            .fetch_one(&self.pool)
             .await?;
 
         Ok(pending)

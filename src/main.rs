@@ -1,14 +1,11 @@
-use anyhow::{Context, Result};
+use std::time::Duration;
 
-use crate::{
+use anyhow::{Context, Result};
+use multiqueue::{
     gates::{FlakyGate, Gate, GateEvaluator, RandomGate},
     multiqueue::MultiQueue,
-    task::{Task, TaskRunner},
+    tasks::{Task, TaskRunner},
 };
-
-mod gates;
-mod multiqueue;
-mod task;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,8 +22,12 @@ async fn main() -> Result<()> {
     let mut evaluator = GateEvaluator {
         gates,
         multiqueue: multiqueue.clone(),
+        poll_interval: Duration::from_millis(1000),
     };
-    let mut runner = TaskRunner { multiqueue };
+    let mut runner = TaskRunner {
+        multiqueue,
+        poll_interval: Duration::from_millis(1500),
+    };
 
     let evaluator_handle = tokio::spawn(async move { evaluator.run().await });
     let runner_handle = tokio::spawn(async move { runner.run().await });

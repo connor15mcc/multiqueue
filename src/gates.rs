@@ -1,8 +1,8 @@
 use anyhow::{Context as _, Result, bail};
 use rand::{Rng, SeedableRng};
-use tokio::time::{self, Duration};
+use tokio::time;
 
-use crate::{multiqueue::MultiQueue, task::*};
+use crate::{multiqueue::MultiQueue, tasks::*};
 
 pub trait Gate: Send {
     fn should_proceed(&mut self, task: &Task) -> Result<bool>;
@@ -50,11 +50,12 @@ impl Gate for FlakyGate {
 pub struct GateEvaluator {
     pub gates: Vec<Box<dyn Gate>>,
     pub multiqueue: MultiQueue,
+    pub poll_interval: time::Duration,
 }
 
 impl GateEvaluator {
     pub async fn run(&mut self) -> Result<()> {
-        let mut interval = time::interval(Duration::from_millis(1000));
+        let mut interval = time::interval(self.poll_interval);
         loop {
             interval.tick().await;
 
