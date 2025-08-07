@@ -1,6 +1,6 @@
 use anyhow::Result;
 use indoc::indoc;
-use sqlx::{SqlitePool, Transaction, Sqlite};
+use sqlx::SqlitePool;
 
 use crate::tasks::*;
 
@@ -20,6 +20,7 @@ impl MultiQueue {
             CREATE TABLE IF NOT EXISTS tasks (
                 name TEXT NOT NULL PRIMARY KEY,
                 state TEXT NOT NULL,
+                worker_id TEXT,
                 last_evaluated_ts INTEGER NOT NULL
             )
         "})
@@ -33,12 +34,13 @@ impl MultiQueue {
         for task in tasks.iter() {
             let result = sqlx::query(indoc! {"
                 INSERT
-                    OR IGNORE INTO tasks (name, state, last_evaluated_ts)
+                    OR IGNORE INTO tasks (name, state, worker_id, last_evaluated_ts)
                 VALUES
-                    ($1, $2, unixepoch())
+                    ($1, $2, $3, unixepoch())
                 "})
             .bind(&task.name)
             .bind(&task.state)
+            .bind(&task.worker_id)
             .execute(&self.pool)
             .await?;
             match result.rows_affected() {
@@ -55,9 +57,10 @@ impl MultiQueue {
     pub async fn get_by_state(&mut self, state: TaskState) -> Result<Vec<Task>> {
         let pending_limit = 5;
         let pending: Vec<Task> = sqlx::query_as(indoc! {"
-            SELECT name, state
+            SELECT name, state, worker_id
             FROM tasks
             WHERE state = $1
+            AND worker_id IS NULL
             ORDER BY last_evaluated_ts ASC
             LIMIT $2
             "})
@@ -76,6 +79,47 @@ impl MultiQueue {
             .await?;
 
         Ok(pending)
+    }
+
+    pub async fn claim_task_for_worker(
+        &self,
+        task_name: &str,
+        worker_id: &str,
+    ) -> Result<Option<Task>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Check if the task is available (not claimed by another worker)
+        let task: Option<Task> = sqlx::query_as(indoc! {"
+            UPDATE tasks
+            SET
+                worker_id = $1,
+                last_evaluated_ts = unixepoch()
+            WHERE
+                name = $2
+                AND worker_id IS NULL
+            RETURNING
+                name, state, worker_id
+            "})
+        .bind(worker_id)
+        .bind(task_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(task)
+    }
+
+    pub async fn release_task_lock(&self, task_name: &str) -> Result<()> {
+        sqlx::query(indoc! {"
+            UPDATE tasks
+            SET worker_id = NULL
+            WHERE name = $1
+            "})
+        .bind(task_name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn transition(&mut self, task: Task, to: TaskState) -> Result<()> {

@@ -24,10 +24,7 @@ async fn main() -> Result<()> {
         multiqueue: multiqueue.clone(),
         poll_interval: Duration::from_millis(1000),
     };
-    let mut runner = TaskRunner {
-        multiqueue,
-        poll_interval: Duration::from_millis(1500),
-    };
+    let mut runner = TaskRunner::new(multiqueue, Duration::from_millis(1500));
 
     let evaluator_handle = tokio::spawn(async move { evaluator.run().await });
     let runner_handle = tokio::spawn(async move { runner.run().await });

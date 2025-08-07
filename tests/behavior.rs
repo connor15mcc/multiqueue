@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use multiqueue::{
     gates::{Gate, GateEvaluator},
     multiqueue::MultiQueue,
-    tasks::{Task, TaskState},
+    tasks::{Task, TaskLock, TaskRunner, TaskState},
 };
 use tokio::time;
 
@@ -216,31 +216,58 @@ async fn test_concurrent_task_exclusive_access() -> Result<()> {
     let worker2_processed = AtomicBool::new(false);
 
     let worker1_future = {
-        let mut multiqueue = multiqueue.clone();
         let worker1_processed = &worker1_processed;
-        async move {
-            for task in multiqueue.get_by_state(TaskState::Queued).await? {
-                // 1-second processing delay
-                time::sleep(Duration::from_secs(1)).await;
+        let mut runner = TaskRunner::new(multiqueue.clone(), Duration::from_millis(10));
 
-                worker1_processed.store(true, Ordering::SeqCst);
-                multiqueue.transition(task, TaskState::Complete).await?;
+        async move {
+            let queued = runner.multiqueue.get_by_state(TaskState::Queued).await?;
+
+            for task in queued {
+                // Try to acquire a lock for this task using RAII TaskLock
+                if let Some(_task_lock) =
+                    TaskLock::try_acquire(&task, runner.multiqueue.clone(), &runner.worker_id)
+                        .await?
+                {
+                    // 1-second processing delay
+                    time::sleep(Duration::from_secs(1)).await;
+
+                    worker1_processed.store(true, Ordering::SeqCst);
+                    runner
+                        .multiqueue
+                        .transition(task, TaskState::Complete)
+                        .await?;
+                }
             }
+
             Ok::<(), anyhow::Error>(())
         }
     };
+
     let worker2_future = {
-        let mut multiqueue = multiqueue.clone();
         let worker2_processed = &worker2_processed;
+        let mut runner = TaskRunner::new(multiqueue.clone(), Duration::from_millis(10));
 
         async move {
-            for task in multiqueue.get_by_state(TaskState::Queued).await? {
-                // 1-second processing delay
-                time::sleep(Duration::from_secs(1)).await;
+            // Custom run loop that only processes one batch of tasks
+            let queued = runner.multiqueue.get_by_state(TaskState::Queued).await?;
 
-                worker2_processed.store(true, Ordering::SeqCst);
-                multiqueue.transition(task, TaskState::Complete).await?;
+            for task in queued {
+                // Try to acquire a lock for this task using RAII TaskLock
+                if let Some(_task_lock) =
+                    TaskLock::try_acquire(&task, runner.multiqueue.clone(), &runner.worker_id)
+                        .await?
+                {
+                    // 1-second processing delay
+                    time::sleep(Duration::from_secs(1)).await;
+
+                    worker2_processed.store(true, Ordering::SeqCst);
+                    runner
+                        .multiqueue
+                        .transition(task, TaskState::Complete)
+                        .await?;
+                }
             }
+
             Ok::<(), anyhow::Error>(())
         }
     };
@@ -274,3 +301,65 @@ async fn test_concurrent_task_exclusive_access() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_lock_release_on_error() -> Result<()> {
+    let task = Task::new("error-test-task");
+    let tasks = vec![task];
+
+    let mut multiqueue = MultiQueue::default().await.context("create DB")?;
+    multiqueue.insert(tasks).await.context("insert task")?;
+
+    for task in multiqueue.get_by_state(TaskState::Waiting).await? {
+        multiqueue.transition(task, TaskState::Queued).await?;
+    }
+
+    // First worker tries to process but encounters an error
+    {
+        let tasks = multiqueue.get_by_state(TaskState::Queued).await?;
+        assert_eq!(tasks.len(), 1);
+
+        let task = tasks.into_iter().nth(0).expect("inserted exactly one");
+
+        // Acquire the lock
+        let task_lock = TaskLock::try_acquire(&task, multiqueue.clone(), "worker-1").await?;
+        assert!(task_lock.is_some(), "Worker 1 should acquire the lock");
+
+        // Now we'll simulate an error by letting the task_lock go out of scope
+        // without explicitly calling complete()
+        drop(task_lock);
+
+        // The lock should have been automatically released via Drop
+    }
+
+    // The second worker should now be able to acquire the lock and complete the task
+    {
+        // Small delay to ensure drop handler completes (since it spawns a task)
+        time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = multiqueue.get_by_state(TaskState::Queued).await?;
+        assert_eq!(tasks.len(), 1, "Task should still be available after error");
+
+        let task = tasks.into_iter().nth(0).expect("inserted exactly one");
+
+        // Worker 2 should be able to acquire the lock
+        let task_lock = TaskLock::try_acquire(&task, multiqueue.clone(), "worker-2").await?;
+        assert!(
+            task_lock.is_some(),
+            "Worker 2 should be able to acquire the lock after error"
+        );
+
+        // Complete the task
+        if let Some(_lock) = task_lock {
+            multiqueue.transition(task, TaskState::Complete).await?;
+        }
+    }
+
+    // Verify the task was completed despite the first worker's error
+    let completed_count = multiqueue.count_with_state(TaskState::Complete).await?;
+    assert_eq!(
+        completed_count, 1,
+        "Task should be completed by the second worker"
+    );
+
+    Ok(())
+}
