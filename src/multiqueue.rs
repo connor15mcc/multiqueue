@@ -19,7 +19,8 @@ impl MultiQueue {
         sqlx::query(indoc! {"
             CREATE TABLE IF NOT EXISTS tasks (
                 name TEXT NOT NULL PRIMARY KEY,
-                state TEXT NOT NULL
+                state TEXT NOT NULL,
+                last_evaluated_ts INTEGER NOT NULL
             )
         "})
         .execute(&pool)
@@ -30,11 +31,16 @@ impl MultiQueue {
 
     pub async fn insert(&mut self, tasks: Vec<Task>) -> Result<()> {
         for task in tasks.iter() {
-            let result = sqlx::query("INSERT OR IGNORE INTO tasks (name, state) VALUES ($1, $2)")
-                .bind(&task.name)
-                .bind(&task.state)
-                .execute(&self.pool)
-                .await?;
+            let result = sqlx::query(indoc! {"
+                INSERT
+                    OR IGNORE INTO tasks (name, state, last_evaluated_ts)
+                VALUES
+                    ($1, $2, unixepoch())
+                "})
+            .bind(&task.name)
+            .bind(&task.state)
+            .execute(&self.pool)
+            .await?;
             match result.rows_affected() {
                 0 => println!("{:?} already exists in DB", task),
                 1 => println!("{:?} inserted into DB", task),
@@ -48,11 +54,17 @@ impl MultiQueue {
     // WARN: this imposes a limit on result size, it is NOT exhaustive
     pub async fn get_by_state(&mut self, state: TaskState) -> Result<Vec<Task>> {
         let pending_limit = 5;
-        let pending: Vec<Task> = sqlx::query_as("SELECT * FROM tasks WHERE state = $1 LIMIT $2")
-            .bind(state)
-            .bind(pending_limit)
-            .fetch_all(&self.pool)
-            .await?;
+        let pending: Vec<Task> = sqlx::query_as(indoc! {"
+            SELECT name, state
+            FROM tasks
+            WHERE state = $1
+            ORDER BY last_evaluated_ts ASC
+            LIMIT $2
+            "})
+        .bind(state)
+        .bind(pending_limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(pending)
     }
@@ -67,11 +79,15 @@ impl MultiQueue {
     }
 
     pub async fn transition(&mut self, task: Task, to: TaskState) -> Result<()> {
-        sqlx::query("UPDATE tasks SET state = $1 WHERE name = $2")
-            .bind(to)
-            .bind(task.name)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(indoc! {"
+            UPDATE tasks
+            SET state = $1, last_evaluated_ts = unixepoch()
+            WHERE name = $2
+            "})
+        .bind(to)
+        .bind(task.name)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }

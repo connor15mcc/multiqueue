@@ -26,29 +26,42 @@ impl Gate for ReadyGate {
     }
 }
 
-struct PausedGate {}
+struct FailGate {}
 
-impl Gate for PausedGate {
+impl Gate for FailGate {
     fn should_proceed(&mut self, _: &multiqueue::tasks::Task) -> anyhow::Result<bool> {
         return Ok(false);
     }
 }
 
-struct FailureGate {}
+struct ErrGate {}
 
-impl Gate for FailureGate {
+impl Gate for ErrGate {
     fn should_proceed(&mut self, _: &multiqueue::tasks::Task) -> anyhow::Result<bool> {
         return Err(anyhow!("failure!"));
     }
 }
 
-struct AdversarialGate {
+struct AdversarialFailGate {
     fail_names: HashSet<String>,
 }
 
-impl Gate for AdversarialGate {
+impl Gate for AdversarialFailGate {
     fn should_proceed(&mut self, task: &multiqueue::tasks::Task) -> anyhow::Result<bool> {
         return Ok(!self.fail_names.contains(&task.name));
+    }
+}
+
+struct AdversarialErrGate {
+    err_names: HashSet<String>,
+}
+
+impl Gate for AdversarialErrGate {
+    fn should_proceed(&mut self, task: &multiqueue::tasks::Task) -> anyhow::Result<bool> {
+        if self.err_names.contains(&task.name) {
+            return Err(anyhow!("failure!"));
+        }
+        return Ok(true);
     }
 }
 
@@ -85,7 +98,7 @@ async fn test_all_paused() -> Result<()> {
     multiqueue.insert(tasks).await.context("insert tasks")?;
 
     let mut evaluator = GateEvaluator {
-        gates: vec![Box::new(PausedGate {})],
+        gates: vec![Box::new(FailGate {})],
         multiqueue: multiqueue.clone(),
         poll_interval: Duration::from_millis(1),
     };
@@ -110,7 +123,7 @@ async fn test_all_failing() -> Result<()> {
     multiqueue.insert(tasks).await.context("insert tasks")?;
 
     let mut evaluator = GateEvaluator {
-        gates: vec![Box::new(FailureGate {})],
+        gates: vec![Box::new(ErrGate {})],
         multiqueue: multiqueue.clone(),
         poll_interval: Duration::from_millis(1),
     };
@@ -128,15 +141,42 @@ async fn test_all_failing() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_first_paused() -> Result<()> {
+async fn test_first_failing() -> Result<()> {
     let tasks = ('a'..='z').map(|c| Task::new(&c.to_string())).collect();
 
     let mut multiqueue = MultiQueue::default().await.context("create DB")?;
     multiqueue.insert(tasks).await.context("insert tasks")?;
 
     let mut evaluator = GateEvaluator {
-        gates: vec![Box::new(AdversarialGate {
+        gates: vec![Box::new(AdversarialFailGate {
             fail_names: ('a'..='m').map(|c| c.to_string()).collect(),
+        })],
+        multiqueue: multiqueue.clone(),
+        poll_interval: Duration::from_millis(1),
+    };
+
+    let _ = tokio::time::timeout(Duration::from_secs(1), evaluator.run()).await;
+
+    assert_eq!(
+        multiqueue
+            .count_with_state(multiqueue::tasks::TaskState::Queued)
+            .await?,
+        13
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_first_err() -> Result<()> {
+    let tasks = ('a'..='z').map(|c| Task::new(&c.to_string())).collect();
+
+    let mut multiqueue = MultiQueue::default().await.context("create DB")?;
+    multiqueue.insert(tasks).await.context("insert tasks")?;
+
+    let mut evaluator = GateEvaluator {
+        gates: vec![Box::new(AdversarialErrGate {
+            err_names: ('a'..='m').map(|c| c.to_string()).collect(),
         })],
         multiqueue: multiqueue.clone(),
         poll_interval: Duration::from_millis(1),

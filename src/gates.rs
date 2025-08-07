@@ -66,7 +66,6 @@ impl GateEvaluator {
                 .context("couldn't get waiting")?;
             println!("{} tasks currently waiting", waiting.len());
 
-            let mut to_be_queued = vec![];
             for task in waiting {
                 let all_gates_proceeding: Result<bool> = self
                     .gates
@@ -77,15 +76,20 @@ impl GateEvaluator {
                         Ok(acc && b)
                     });
 
+                // HACK: we "transition" back to `Waiting` (it's current state) if we can't
+                // transition to `Queued` so as to update the timestamp and put at the end of the
+                // line. This could eventually simply update the ts in the unhappy case, rather
+                // than a full (no-op) transition
+                let mut next = TaskState::Waiting;
                 match all_gates_proceeding {
                     Ok(true) => {
                         println!("{} eligible for transition", &task.name);
-                        to_be_queued.push(task);
+                        next = TaskState::Queued;
                     }
                     Ok(false) => {
                         println!(
                             "{} ineligible for transition: should not proceed",
-                            &task.name,
+                            &task.name
                         );
                     }
                     Err(e) => {
@@ -95,12 +99,7 @@ impl GateEvaluator {
                         );
                     }
                 }
-            }
-
-            for task in to_be_queued {
-                let name = task.name.to_owned();
-                self.multiqueue.transition(task, TaskState::Queued).await?;
-                println!("{} enqueued", name);
+                self.multiqueue.transition(task, next).await?;
             }
         }
     }
