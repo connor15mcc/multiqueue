@@ -1,6 +1,6 @@
 use anyhow::Result;
 use indoc::indoc;
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, Transaction, Sqlite};
 
 use crate::tasks::*;
 

@@ -1,11 +1,16 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use multiqueue::{
     gates::{Gate, GateEvaluator},
     multiqueue::MultiQueue,
-    tasks::Task,
+    tasks::{Task, TaskState},
 };
+use tokio::time;
 
 /*
  * Implementation must:
@@ -193,3 +198,79 @@ async fn test_first_err() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_concurrent_task_exclusive_access() -> Result<()> {
+    let task = Task::new("exclusive-task");
+    let tasks = vec![task];
+
+    let mut multiqueue = MultiQueue::default().await.context("create DB")?;
+    multiqueue.insert(tasks).await.context("insert task")?;
+
+    for task in multiqueue.get_by_state(TaskState::Waiting).await? {
+        multiqueue.transition(task, TaskState::Queued).await?;
+    }
+
+    // Set up tracking for which worker processed the task
+    let worker1_processed = AtomicBool::new(false);
+    let worker2_processed = AtomicBool::new(false);
+
+    let worker1_future = {
+        let mut multiqueue = multiqueue.clone();
+        let worker1_processed = &worker1_processed;
+        async move {
+            for task in multiqueue.get_by_state(TaskState::Queued).await? {
+                // 1-second processing delay
+                time::sleep(Duration::from_secs(1)).await;
+
+                worker1_processed.store(true, Ordering::SeqCst);
+                multiqueue.transition(task, TaskState::Complete).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+    let worker2_future = {
+        let mut multiqueue = multiqueue.clone();
+        let worker2_processed = &worker2_processed;
+
+        async move {
+            for task in multiqueue.get_by_state(TaskState::Queued).await? {
+                // 1-second processing delay
+                time::sleep(Duration::from_secs(1)).await;
+
+                worker2_processed.store(true, Ordering::SeqCst);
+                multiqueue.transition(task, TaskState::Complete).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    // Run both workers concurrently
+    let (worker1_result, worker2_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(3), worker1_future),
+        tokio::time::timeout(Duration::from_secs(3), worker2_future)
+    );
+
+    // Handle potential timeouts
+    worker1_result.unwrap().unwrap();
+    worker2_result.unwrap().unwrap();
+
+    // Check which workers processed the task
+    let worker1_did_process = worker1_processed.load(Ordering::SeqCst);
+    let worker2_did_process = worker2_processed.load(Ordering::SeqCst);
+
+    // Assert that only one worker processed the task
+    assert!(
+        (worker1_did_process ^ worker2_did_process),
+        "Task was processed by both workers: worker1={}, worker2={}",
+        worker1_did_process,
+        worker2_did_process
+    );
+
+    // Verify the task was completed exactly once
+    let completed_count = multiqueue.count_with_state(TaskState::Complete).await?;
+    assert_eq!(completed_count, 1);
+
+    Ok(())
+}
+
