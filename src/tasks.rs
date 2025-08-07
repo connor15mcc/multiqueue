@@ -122,3 +122,49 @@ impl TaskRunner {
         }
     }
 }
+
+pub struct TaskObserver {
+    pub multiqueue: MultiQueue,
+    pub poll_interval: time::Duration,
+}
+
+impl TaskObserver {
+    pub fn new(multiqueue: MultiQueue, poll_interval: time::Duration) -> Self {
+        Self {
+            multiqueue,
+            poll_interval,
+        }
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let mut interval = time::interval(self.poll_interval);
+        loop {
+            interval.tick().await;
+
+            let waiting_count = self.multiqueue.count_with_state(TaskState::Waiting).await?;
+            let queued_count = self.multiqueue.count_with_state(TaskState::Queued).await?;
+            let completed_count = self
+                .multiqueue
+                .count_with_state(TaskState::Complete)
+                .await?;
+            let total_count = waiting_count + queued_count + completed_count;
+
+            if total_count == 0 {
+                println!("Tasks: None");
+                continue;
+            }
+
+            // Print state distribution on a single line
+            println!(
+                "Tasks: {} total [W: {} ({:.1}%), Q: {} ({:.1}%), C: {} ({:.1}%)]",
+                total_count,
+                waiting_count,
+                100.0 * waiting_count as f64 / total_count as f64,
+                queued_count,
+                100.0 * queued_count as f64 / total_count as f64,
+                completed_count,
+                100.0 * completed_count as f64 / total_count as f64
+            );
+        }
+    }
+}
