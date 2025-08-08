@@ -137,4 +137,34 @@ impl MultiQueue {
 
         Ok(())
     }
+
+    pub async fn cancel_tasks(&mut self, task_names: &[&str]) -> Result<u64> {
+        if task_names.is_empty() {
+            return Ok(0);
+        }
+
+        // Use a transaction for better performance with multiple updates
+        let mut tx = self.pool.begin().await?;
+
+        let mut total_cancelled = 0;
+        for name in task_names {
+            let result = sqlx::query(indoc! {"
+                UPDATE tasks
+                SET state = $1, last_evaluated_ts = unixepoch()
+                WHERE name = $2
+                AND (state = $3 OR state = $4)
+                "})
+            .bind(TaskState::Cancelled)
+            .bind(name)
+            .bind(TaskState::Waiting)
+            .bind(TaskState::Queued)
+            .execute(&mut *tx)
+            .await?;
+
+            total_cancelled += result.rows_affected();
+        }
+
+        tx.commit().await?;
+        Ok(total_cancelled)
+    }
 }

@@ -4,17 +4,12 @@ use uuid::Uuid;
 
 use crate::multiqueue::MultiQueue;
 
-#[derive(sqlx::Type, Debug, Clone, PartialEq)]
+#[derive(sqlx::Type, Debug, Clone, PartialEq, Default)]
 #[repr(i32)]
 pub enum TaskPriority {
+    #[default]
     Low = 0,
     High = 1,
-}
-
-impl Default for TaskPriority {
-    fn default() -> Self {
-        TaskPriority::Low
-    }
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
@@ -26,11 +21,12 @@ pub struct Task {
     pub priority: TaskPriority,
 }
 
-#[derive(sqlx::Type, Debug, Clone)]
+#[derive(sqlx::Type, Debug, Clone, PartialEq)]
 pub enum TaskState {
     Waiting,
     Queued,
     Complete,
+    Cancelled,
 }
 
 impl Task {
@@ -42,7 +38,7 @@ impl Task {
             priority: TaskPriority::default(),
         }
     }
-    
+
     pub fn with_priority(s: &str, priority: TaskPriority) -> Self {
         Task {
             name: s.to_string(),
@@ -171,24 +167,76 @@ impl TaskObserver {
                 .multiqueue
                 .count_with_state(TaskState::Complete)
                 .await?;
-            let total_count = waiting_count + queued_count + completed_count;
+            let cancelled_count = self
+                .multiqueue
+                .count_with_state(TaskState::Cancelled)
+                .await?;
+            let total_count = waiting_count + queued_count + completed_count + cancelled_count;
 
             if total_count == 0 {
                 println!("Tasks: None");
                 continue;
             }
 
-            // Print state distribution on a single line
             println!(
-                "Tasks: {} total [W: {} ({:.1}%), Q: {} ({:.1}%), C: {} ({:.1}%)]",
+                "Tasks: {} total [W: {} ({:.1}%), Q: {} ({:.1}%), C: {} ({:.1}%), X: {} ({:.1}%)]",
                 total_count,
                 waiting_count,
                 100.0 * waiting_count as f64 / total_count as f64,
                 queued_count,
                 100.0 * queued_count as f64 / total_count as f64,
                 completed_count,
-                100.0 * completed_count as f64 / total_count as f64
+                100.0 * completed_count as f64 / total_count as f64,
+                cancelled_count,
+                100.0 * cancelled_count as f64 / total_count as f64
             );
+        }
+    }
+}
+
+pub struct TaskCanceller {
+    pub multiqueue: MultiQueue,
+    pub poll_interval: time::Duration,
+    pub pipe_path: String,
+}
+
+impl TaskCanceller {
+    pub fn new(multiqueue: MultiQueue, poll_interval: time::Duration, pipe_path: String) -> Self {
+        Self {
+            multiqueue,
+            poll_interval,
+            pipe_path,
+        }
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let mut interval = time::interval(self.poll_interval);
+        loop {
+            interval.tick().await;
+
+            let path = std::path::Path::new(&self.pipe_path);
+            if !path.exists() {
+                continue;
+            }
+
+            let content = tokio::fs::read_to_string(&self.pipe_path).await?;
+            let tasks_to_cancel: Vec<&str> =
+                content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+            if tasks_to_cancel.is_empty() {
+                continue;
+            }
+
+            println!(
+                "Received cancellation request for tasks: {:?}",
+                tasks_to_cancel
+            );
+
+            let count = self.multiqueue.cancel_tasks(&tasks_to_cancel).await?;
+            println!("Cancelled {} tasks", count);
+
+            // Remove the pipe after processing to avoid reprocessing the same data
+            tokio::fs::remove_file(&self.pipe_path).await?;
         }
     }
 }

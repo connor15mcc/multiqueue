@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use multiqueue::{
     gates::{Gate, GateEvaluator},
     multiqueue::MultiQueue,
-    tasks::{Task, TaskLock, TaskRunner, TaskState, TaskPriority},
+    tasks::{Task, TaskLock, TaskPriority, TaskRunner, TaskState},
 };
 use tokio::time;
 
@@ -372,33 +372,91 @@ async fn test_task_priorities() -> Result<()> {
     tasks.push(Task::with_priority("low-1", TaskPriority::Low));
     tasks.push(Task::with_priority("low-2", TaskPriority::Low));
     tasks.push(Task::with_priority("low-3", TaskPriority::Low));
-    
+
     // Create high priority tasks
     tasks.push(Task::with_priority("high-1", TaskPriority::High));
     tasks.push(Task::with_priority("high-2", TaskPriority::High));
-    
+
     // Insert tasks into the queue
     let mut multiqueue = MultiQueue::default().await.context("create DB")?;
     multiqueue.insert(tasks).await.context("insert tasks")?;
-    
+
     // Transition all tasks to Queued state
     for task in multiqueue.get_by_state(TaskState::Waiting).await? {
         multiqueue.transition(task, TaskState::Queued).await?;
     }
-    
+
     // Get tasks in Queued state - they should be ordered by priority
     let queued_tasks = multiqueue.get_by_state(TaskState::Queued).await?;
-    
+
     // Assert that high priority tasks are returned first
     assert_eq!(queued_tasks.len(), 5);
     assert_eq!(queued_tasks[0].name, "high-1");
     assert_eq!(queued_tasks[1].name, "high-2");
-    
+
     // The next tasks should be the low priority ones
     // (Their order among themselves is determined by insertion order/timestamp)
     assert_eq!(queued_tasks[2].name, "low-1");
     assert_eq!(queued_tasks[3].name, "low-2");
     assert_eq!(queued_tasks[4].name, "low-3");
-    
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_task_cancellation() -> Result<()> {
+    // Create tasks
+    let mut tasks = Vec::new();
+    tasks.push(Task::new("task-to-cancel-1"));
+    tasks.push(Task::new("task-to-cancel-2"));
+    tasks.push(Task::new("task-to-keep-1"));
+    tasks.push(Task::new("task-to-keep-2"));
+
+    // Insert tasks into the queue
+    let mut multiqueue = MultiQueue::default().await.context("create DB")?;
+    multiqueue.insert(tasks).await.context("insert tasks")?;
+
+    // Transition tasks to Queued state
+    for task in multiqueue.get_by_state(TaskState::Waiting).await? {
+        multiqueue.transition(task, TaskState::Queued).await?;
+    }
+
+    // Verify initial state
+    assert_eq!(multiqueue.count_with_state(TaskState::Queued).await?, 4);
+    assert_eq!(multiqueue.count_with_state(TaskState::Cancelled).await?, 0);
+
+    // Cancel specific tasks
+    let tasks_to_cancel = ["task-to-cancel-1", "task-to-cancel-2"];
+    let cancelled_count = multiqueue.cancel_tasks(&tasks_to_cancel).await?;
+
+    // Verify two tasks were cancelled
+    assert_eq!(cancelled_count, 2);
+
+    // Verify counts of tasks in each state
+    assert_eq!(multiqueue.count_with_state(TaskState::Queued).await?, 2);
+    assert_eq!(multiqueue.count_with_state(TaskState::Cancelled).await?, 2);
+
+    // Get cancelled tasks to verify the correct ones were cancelled
+    let cancelled_tasks = multiqueue.get_by_state(TaskState::Cancelled).await?;
+    assert_eq!(cancelled_tasks.len(), 2);
+
+    // Check that the right tasks were cancelled
+    let cancelled_names: Vec<String> = cancelled_tasks
+        .iter()
+        .map(|task| task.name.clone())
+        .collect();
+
+    assert!(cancelled_names.contains(&"task-to-cancel-1".to_string()));
+    assert!(cancelled_names.contains(&"task-to-cancel-2".to_string()));
+
+    // Verify the other tasks are still in the queue
+    let queued_tasks = multiqueue.get_by_state(TaskState::Queued).await?;
+    assert_eq!(queued_tasks.len(), 2);
+
+    let queued_names: Vec<String> = queued_tasks.iter().map(|task| task.name.clone()).collect();
+
+    assert!(queued_names.contains(&"task-to-keep-1".to_string()));
+    assert!(queued_names.contains(&"task-to-keep-2".to_string()));
+
     Ok(())
 }
