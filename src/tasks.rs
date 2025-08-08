@@ -4,12 +4,26 @@ use uuid::Uuid;
 
 use crate::multiqueue::MultiQueue;
 
+#[derive(sqlx::Type, Debug, Clone, PartialEq)]
+#[repr(i32)]
+pub enum TaskPriority {
+    Low = 0,
+    High = 1,
+}
+
+impl Default for TaskPriority {
+    fn default() -> Self {
+        TaskPriority::Low
+    }
+}
+
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct Task {
     #[allow(dead_code)]
     pub name: String,
     pub state: TaskState,
     pub worker_id: Option<String>,
+    pub priority: TaskPriority,
 }
 
 #[derive(sqlx::Type, Debug, Clone)]
@@ -25,6 +39,16 @@ impl Task {
             name: s.to_string(),
             state: TaskState::Waiting,
             worker_id: None,
+            priority: TaskPriority::default(),
+        }
+    }
+    
+    pub fn with_priority(s: &str, priority: TaskPriority) -> Self {
+        Task {
+            name: s.to_string(),
+            state: TaskState::Waiting,
+            worker_id: None,
+            priority,
         }
     }
 }

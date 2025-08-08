@@ -21,6 +21,7 @@ impl MultiQueue {
                 name TEXT NOT NULL PRIMARY KEY,
                 state TEXT NOT NULL,
                 worker_id TEXT,
+                priority INTEGER NOT NULL,
                 last_evaluated_ts INTEGER NOT NULL
             )
         "})
@@ -34,13 +35,14 @@ impl MultiQueue {
         for task in tasks.iter() {
             let result = sqlx::query(indoc! {"
                 INSERT
-                    OR IGNORE INTO tasks (name, state, worker_id, last_evaluated_ts)
+                    OR IGNORE INTO tasks (name, state, worker_id, priority, last_evaluated_ts)
                 VALUES
-                    ($1, $2, $3, unixepoch())
+                    ($1, $2, $3, $4, unixepoch())
                 "})
             .bind(&task.name)
             .bind(&task.state)
             .bind(&task.worker_id)
+            .bind(&task.priority)
             .execute(&self.pool)
             .await?;
             match result.rows_affected() {
@@ -57,11 +59,11 @@ impl MultiQueue {
     pub async fn get_by_state(&mut self, state: TaskState) -> Result<Vec<Task>> {
         let pending_limit = 5;
         let pending: Vec<Task> = sqlx::query_as(indoc! {"
-            SELECT name, state, worker_id
+            SELECT name, state, worker_id, priority
             FROM tasks
             WHERE state = $1
             AND worker_id IS NULL
-            ORDER BY last_evaluated_ts ASC
+            ORDER BY priority DESC, last_evaluated_ts ASC
             LIMIT $2
             "})
         .bind(state)
@@ -98,7 +100,7 @@ impl MultiQueue {
                 name = $2
                 AND worker_id IS NULL
             RETURNING
-                name, state, worker_id
+                name, state, worker_id, priority
             "})
         .bind(worker_id)
         .bind(task_name)

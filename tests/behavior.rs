@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use multiqueue::{
     gates::{Gate, GateEvaluator},
     multiqueue::MultiQueue,
-    tasks::{Task, TaskLock, TaskRunner, TaskState},
+    tasks::{Task, TaskLock, TaskRunner, TaskState, TaskPriority},
 };
 use tokio::time;
 
@@ -361,5 +361,44 @@ async fn test_lock_release_on_error() -> Result<()> {
         "Task should be completed by the second worker"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_task_priorities() -> Result<()> {
+    let mut tasks = Vec::new();
+
+    // Create low priority tasks
+    tasks.push(Task::with_priority("low-1", TaskPriority::Low));
+    tasks.push(Task::with_priority("low-2", TaskPriority::Low));
+    tasks.push(Task::with_priority("low-3", TaskPriority::Low));
+    
+    // Create high priority tasks
+    tasks.push(Task::with_priority("high-1", TaskPriority::High));
+    tasks.push(Task::with_priority("high-2", TaskPriority::High));
+    
+    // Insert tasks into the queue
+    let mut multiqueue = MultiQueue::default().await.context("create DB")?;
+    multiqueue.insert(tasks).await.context("insert tasks")?;
+    
+    // Transition all tasks to Queued state
+    for task in multiqueue.get_by_state(TaskState::Waiting).await? {
+        multiqueue.transition(task, TaskState::Queued).await?;
+    }
+    
+    // Get tasks in Queued state - they should be ordered by priority
+    let queued_tasks = multiqueue.get_by_state(TaskState::Queued).await?;
+    
+    // Assert that high priority tasks are returned first
+    assert_eq!(queued_tasks.len(), 5);
+    assert_eq!(queued_tasks[0].name, "high-1");
+    assert_eq!(queued_tasks[1].name, "high-2");
+    
+    // The next tasks should be the low priority ones
+    // (Their order among themselves is determined by insertion order/timestamp)
+    assert_eq!(queued_tasks[2].name, "low-1");
+    assert_eq!(queued_tasks[3].name, "low-2");
+    assert_eq!(queued_tasks[4].name, "low-3");
+    
     Ok(())
 }

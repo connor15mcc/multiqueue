@@ -4,12 +4,18 @@ use anyhow::{Context, Result};
 use multiqueue::{
     gates::{FlakyGate, Gate, GateEvaluator, RandomGate},
     multiqueue::MultiQueue,
-    tasks::{Task, TaskObserver, TaskRunner},
+    tasks::{Task, TaskObserver, TaskRunner, TaskPriority},
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let tasks = ('a'..='z').map(|c| Task::new(&c.to_string())).collect();
+    let tasks = ('a'..='z').enumerate().map(|(i, c)| {
+        if (i + 1) % 8 == 0 {
+            Task::with_priority(&c.to_string(), TaskPriority::High)
+        } else {
+            Task::new(&c.to_string())
+        }
+    }).collect();
 
     let mut multiqueue = MultiQueue::default().await.context("create DB")?;
     multiqueue.insert(tasks).await.context("insert tasks")?;
