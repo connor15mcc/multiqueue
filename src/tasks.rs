@@ -19,6 +19,7 @@ pub struct Task {
     pub state: TaskState,
     pub worker_id: Option<String>,
     pub priority: TaskPriority,
+    pub enqueued_time: i64,
 }
 
 #[derive(sqlx::Type, Debug, Clone, PartialEq)]
@@ -36,6 +37,10 @@ impl Task {
             state: TaskState::Waiting,
             worker_id: None,
             priority: TaskPriority::default(),
+            enqueued_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
         }
     }
 
@@ -45,6 +50,10 @@ impl Task {
             state: TaskState::Waiting,
             worker_id: None,
             priority,
+            enqueued_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
         }
     }
 }

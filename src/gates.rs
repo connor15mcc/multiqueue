@@ -1,5 +1,11 @@
 use anyhow::{Context as _, Result, bail};
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+};
 use rand::{Rng, SeedableRng};
+use std::{collections::BTreeMap, num::NonZeroU32, time::SystemTime, time::UNIX_EPOCH};
 use tokio::time;
 
 use crate::{multiqueue::MultiQueue, tasks::*};
@@ -7,6 +13,8 @@ use crate::{multiqueue::MultiQueue, tasks::*};
 pub trait Gate: Send {
     fn should_proceed(&mut self, task: &Task) -> Result<bool>;
 }
+
+// Removed undefined BakeGate implementation
 
 pub struct RandomGate {
     rng: rand::rngs::StdRng,
@@ -44,6 +52,116 @@ impl Gate for FlakyGate {
             bail!("oops, looks like I failed!")
         }
         Ok(true)
+    }
+}
+
+pub struct RateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    // Filter function to decide if rate limiting should apply
+    filter: F,
+}
+
+impl<F> RateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    pub fn new(tasks_per_minute: NonZeroU32, filter: F) -> Self {
+        let quota = Quota::per_minute(tasks_per_minute);
+        let limiter = RateLimiter::direct(quota);
+        Self { limiter, filter }
+    }
+}
+
+impl<F> Gate for RateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    fn should_proceed(&mut self, task: &Task) -> Result<bool> {
+        if !(self.filter)(task) {
+            // Task is not subject to rate limiting
+            return Ok(true);
+        }
+
+        match self.limiter.check() {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+/// A rate limiter that dynamically adjusts limits based on task age.
+/// Tasks are categorized into "buckets" based on their age, and each bucket
+/// has its own rate limit configuration.
+pub struct DynamicRateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    // Ordered map of time thresholds (in seconds) to rate limiters The key is the max age in
+    // seconds, and the value is the rate limiter for tasks within that age
+    limiters: BTreeMap<u64, RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    // Filter function to decide if rate limiting should apply
+    filter: F,
+}
+
+impl<F> DynamicRateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    pub fn new(age_limits: BTreeMap<u64, NonZeroU32>, filter: F) -> Self {
+        let mut limiters = BTreeMap::new();
+
+        for (age, limit) in age_limits {
+            let quota = Quota::per_minute(limit);
+            limiters.insert(age, RateLimiter::direct(quota));
+        }
+
+        Self { filter, limiters }
+    }
+
+    fn get_task_age_seconds(&self, task: &Task) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        (now - task.enqueued_time).max(0) as u64
+    }
+
+    fn get_limiter_for_task(
+        &self,
+        task: &Task,
+    ) -> Option<&RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
+        let task_age = self.get_task_age_seconds(task);
+
+        // Find the next entry larger than the task age, such that task_age <= bucket
+        match self.limiters.range(task_age..).next() {
+            Some((_, limiter)) => Some(limiter),
+            None => None,
+        }
+    }
+}
+
+impl<F> Gate for DynamicRateLimitGate<F>
+where
+    F: FnMut(&Task) -> bool + Send,
+{
+    fn should_proceed(&mut self, task: &Task) -> Result<bool> {
+        if !(self.filter)(task) {
+            return Ok(true);
+        }
+
+        let limiter = self.get_limiter_for_task(task);
+        let Some(limiter) = limiter else {
+            bail!("no limiter configured for task {:?}", task)
+        };
+
+        match limiter.check() {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 }
 

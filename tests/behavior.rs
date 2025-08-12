@@ -1,12 +1,13 @@
+use nonzero_ext::nonzero;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use multiqueue::{
-    gates::{Gate, GateEvaluator},
+    gates::{DynamicRateLimitGate, Gate, GateEvaluator, RateLimitGate},
     multiqueue::MultiQueue,
     tasks::{Task, TaskLock, TaskPriority, TaskRunner, TaskState},
 };
@@ -457,6 +458,243 @@ async fn test_task_cancellation() -> Result<()> {
 
     assert!(queued_names.contains(&"task-to-keep-1".to_string()));
     assert!(queued_names.contains(&"task-to-keep-2".to_string()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rate_limit_gate() -> Result<()> {
+    // Create a RateLimitGate with a limit of 3 tasks per minute
+    // The filter will only apply to tasks with names starting with "limit-"
+    let mut rate_limit_gate = RateLimitGate::new(nonzero!(3u32), |task: &Task| {
+        task.name.starts_with("limit-")
+    });
+
+    // Create test tasks
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Tasks that should be rate limited (names start with "limit-")
+    let limit_task1 = Task {
+        name: "limit-task-1".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    let limit_task2 = Task {
+        name: "limit-task-2".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    let limit_task3 = Task {
+        name: "limit-task-3".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    let limit_task4 = Task {
+        name: "limit-task-4".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    // Tasks that should NOT be rate limited (names don't start with "limit-")
+    let regular_task1 = Task {
+        name: "regular-task-1".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    let regular_task2 = Task {
+        name: "regular-task-2".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now,
+    };
+
+    // Test rate limit behavior
+
+    // First 3 limited tasks should pass
+    assert!(rate_limit_gate.should_proceed(&limit_task1).unwrap());
+    assert!(rate_limit_gate.should_proceed(&limit_task2).unwrap());
+    assert!(rate_limit_gate.should_proceed(&limit_task3).unwrap());
+
+    // Fourth limited task should be rate limited
+    assert!(!rate_limit_gate.should_proceed(&limit_task4).unwrap());
+
+    // Regular tasks should always pass regardless of the rate limit
+    assert!(rate_limit_gate.should_proceed(&regular_task1).unwrap());
+    assert!(rate_limit_gate.should_proceed(&regular_task2).unwrap());
+
+    // Note: Testing the rolling window would require waiting or mocking time,
+    // which is now handled internally by the governor crate. The governor crate
+    // has its own comprehensive tests for the rolling window behavior.
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dynamic_rate_limit_gate() -> Result<()> {
+    // Create a DynamicRateLimitGate with different rate limits based on task age
+    // - Tasks 0-30 seconds old: 2 per minute
+    // - Tasks 31-60 seconds old: 5 per minute
+    // - Tasks older than 60 seconds: 10 per minute
+    // - Default limit (when no age bracket matches): 1 per minute
+
+    let mut age_limits = BTreeMap::new();
+    age_limits.insert(30, nonzero!(2u32)); // 0-30 seconds: 2 tasks/minute
+    age_limits.insert(60, nonzero!(5u32)); // 31-60 seconds: 5 tasks/minute
+    age_limits.insert(120, nonzero!(10u32)); // 61-120 seconds: 10 tasks/minute
+
+    let mut dynamic_gate = DynamicRateLimitGate::new(
+        age_limits,
+        |task: &Task| task.name.starts_with("rate-"), // Only rate-limit tasks with "rate-" prefix
+    );
+
+    // Get the current timestamp
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Create tasks with different ages
+
+    // Recent tasks (0-30 seconds old)
+    let recent_task1 = Task {
+        name: "rate-recent-1".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 5,
+    };
+
+    let recent_task2 = Task {
+        name: "rate-recent-2".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 10,
+    };
+
+    let recent_task3 = Task {
+        name: "rate-recent-3".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 15,
+    };
+
+    // Medium-aged tasks (31-60 seconds old)
+    let medium_task1 = Task {
+        name: "rate-medium-1".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 45,
+    };
+
+    let medium_task2 = Task {
+        name: "rate-medium-2".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 50,
+    };
+
+    let medium_task3 = Task {
+        name: "rate-medium-3".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 55,
+    };
+
+    let medium_task4 = Task {
+        name: "rate-medium-4".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 60,
+    };
+
+    let medium_task5 = Task {
+        name: "rate-medium-5".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 60,
+    };
+
+    let medium_task6 = Task {
+        name: "rate-medium-6".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 60,
+    };
+
+    // Older tasks (61-120 seconds old)
+    let older_task1 = Task {
+        name: "rate-older-1".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 90,
+    };
+
+    let older_task2 = Task {
+        name: "rate-older-2".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 100,
+    };
+
+    // Non-rate-limited task (doesn't match filter)
+    let non_limited_task = Task {
+        name: "normal-task".to_string(),
+        state: TaskState::Waiting,
+        worker_id: None,
+        priority: TaskPriority::Low,
+        enqueued_time: now - 10,
+    };
+
+    // Test dynamic rate limiting based on task age
+
+    // Recent tasks (0-30 seconds old): limit is 2 per minute
+    assert!(dynamic_gate.should_proceed(&recent_task1).unwrap());
+    assert!(dynamic_gate.should_proceed(&recent_task2).unwrap());
+    assert!(!dynamic_gate.should_proceed(&recent_task3).unwrap()); // Should be limited
+
+    // Medium-aged tasks (31-60 seconds old): limit is 5 per minute
+    assert!(dynamic_gate.should_proceed(&medium_task1).unwrap());
+    assert!(dynamic_gate.should_proceed(&medium_task2).unwrap());
+    assert!(dynamic_gate.should_proceed(&medium_task3).unwrap());
+    assert!(dynamic_gate.should_proceed(&medium_task4).unwrap());
+    assert!(dynamic_gate.should_proceed(&medium_task5).unwrap());
+    assert!(!dynamic_gate.should_proceed(&medium_task6).unwrap()); // Should be limited
+
+    // Older tasks (61-120 seconds old): limit is 10 per minute
+    assert!(dynamic_gate.should_proceed(&older_task1).unwrap());
+    assert!(dynamic_gate.should_proceed(&older_task2).unwrap());
+    // We would need 9 more tasks to hit the limit of 10 per minute
+
+    // Non-rate-limited tasks: should always pass
+    assert!(dynamic_gate.should_proceed(&non_limited_task).unwrap());
 
     Ok(())
 }
