@@ -156,7 +156,7 @@
 	}
 
 	.clickable:hover {
-		color: #1976d2;
+		color: #8e44ad;
 	}
 
 	.title-wrapper {

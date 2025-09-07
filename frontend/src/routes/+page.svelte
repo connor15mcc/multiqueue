@@ -126,8 +126,8 @@
 
 			for (const name of taskNames) {
 				try {
-					// const priority = Math.random() > 0.7 ? 1 : 0;
-					const priority = 0;
+					const priority = Math.random() > 0.75 ? 1 : 0;
+					// const priority = 0;
 					const tier = () => {
 						const r = Math.random();
 						if (r < 0.4) {
@@ -186,23 +186,19 @@
 
 <div class="task-container">
 	<!-- Put Cancelled list first -->
-	{#each taskStates.filter(state => state.name === 'Cancelled') as state}
-		<TaskList 
-			stateName={state.name} 
-			stateId={state.id} 
-			count={state.count} 
+	{#each taskStates.filter((state) => state.name === 'Cancelled') as state}
+		<TaskList
+			stateName={state.name}
+			stateId={state.id}
+			count={state.count}
 			collapsible={true}
 			initiallyCollapsed={true}
 		/>
 	{/each}
-	
+
 	<!-- Then show the remaining task lists -->
-	{#each taskStates.filter(state => state.name !== 'Cancelled') as state}
-		<TaskList 
-			stateName={state.name} 
-			stateId={state.id} 
-			count={state.count} 
-		/>
+	{#each taskStates.filter((state) => state.name !== 'Cancelled') as state}
+		<TaskList stateName={state.name} stateId={state.id} count={state.count} />
 	{/each}
 </div>
 
@@ -260,7 +256,7 @@
 		font-size: 1rem;
 		white-space: nowrap;
 		transition: background-color 0.2s;
-		background-color: #5c6bc0;
+		background-color: #8e44ad;
 		height: 100%;
 		width: 100%;
 		display: flex;
@@ -269,7 +265,7 @@
 	}
 
 	.generate-button:hover:not(:disabled) {
-		background-color: #3f51b5;
+		background-color: #6c3483;
 	}
 
 	.generate-button:disabled {
@@ -281,7 +277,7 @@
 		font-size: 0.8rem;
 		text-align: center;
 		margin-top: 0.25rem;
-		color: #4caf50;
+		color: #2196f3;
 	}
 
 	.task-container {
@@ -291,7 +287,7 @@
 		margin: 0 auto;
 		padding: 1rem;
 	}
-	
+
 	@media (min-width: 1200px) {
 		.task-container {
 			flex-wrap: nowrap;

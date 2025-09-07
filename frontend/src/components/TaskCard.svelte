@@ -50,7 +50,7 @@
 
 	// Get color based on priority
 	function getPriorityColor(priority: number): string {
-		return priority === 1 ? '#f44336' : '#2196f3';
+		return priority === 1 ? '#ffc107' : '#9b59b6';
 	}
 </script>
 
@@ -129,7 +129,7 @@
 	}
 
 	.cancel-button {
-		background-color: #f44336;
+		background-color: #ffc107;
 		color: white;
 		border: none;
 		border-radius: 4px;
@@ -141,7 +141,7 @@
 	}
 
 	.cancel-button:hover:not(:disabled) {
-		background-color: #d32f2f;
+		background-color: #ffb300;
 	}
 
 	.cancel-button:disabled {
@@ -165,7 +165,7 @@
 
 	.task-tier {
 		font-size: 0.8rem;
-		color: #666;
+		color: #888;
 	}
 
 	.priority-badge {
@@ -179,7 +179,7 @@
 
 	.task-details {
 		font-size: 0.8rem;
-		color: #666;
+		color: #888;
 	}
 
 	.created-at,

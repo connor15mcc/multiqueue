@@ -174,6 +174,10 @@
 		font-size: 1rem;
 	}
 
+	input[type='radio'] {
+		background-color: #d6f651;
+	}
+
 	.radio-group {
 		display: flex;
 		gap: 1rem;
@@ -190,20 +194,20 @@
 	}
 
 	.error-message {
-		color: #e53935;
+		color: #ffc107;
 		font-size: 0.9rem;
 		padding: 0.25rem 0;
 	}
 
 	.success-message {
-		color: #43a047;
+		color: #2196f3;
 		font-size: 0.9rem;
 		padding: 0.25rem 0;
 	}
 
 	.submit-button {
 		padding: 0.5rem 1rem;
-		background-color: #4caf50;
+		background-color: #d6f651;
 		color: white;
 		border: none;
 		border-radius: 4px;
@@ -214,11 +218,11 @@
 	}
 
 	.submit-button:hover:not(:disabled) {
-		background-color: #45a049;
+		background-color: #e7fa9a;
 	}
 
 	.submit-button:disabled {
-		background-color: #cccccc;
+		background-color: #e3ebfe;
 		cursor: not-allowed;
 	}
 </style>

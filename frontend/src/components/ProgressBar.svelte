@@ -143,15 +143,15 @@
 	}
 
 	.complete {
-		background-color: #4caf50;
+		background-color: #d6f651;
 	}
 
 	.in-progress {
-		background-color: #2196f3;
+		background-color: #9b59b6;
 	}
 
 	.cancelled {
-		background-color: #f44336;
+		background-color: #ffc107;
 	}
 
 	.progress-legend {
