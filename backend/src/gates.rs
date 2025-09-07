@@ -4,9 +4,11 @@ use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
 };
+use nonzero_ext::nonzero;
 use rand::{Rng, SeedableRng};
 use std::{collections::BTreeMap, num::NonZeroU32, time::SystemTime, time::UNIX_EPOCH};
 use tokio::time;
+use tracing::debug;
 
 use crate::{multiqueue::MultiQueue, tasks::*};
 
@@ -114,7 +116,7 @@ where
         let mut limiters = BTreeMap::new();
 
         for (age, limit) in age_limits {
-            let quota = Quota::per_minute(limit);
+            let quota = Quota::per_minute(limit).allow_burst(nonzero!(1u32));
             limiters.insert(age, RateLimiter::direct(quota));
         }
 
@@ -127,7 +129,7 @@ where
             .unwrap_or_default()
             .as_secs() as i64;
 
-        (now - task.enqueued_time).max(0) as u64
+        (now - task.created_at).max(0) as u64
     }
 
     fn get_limiter_for_task(
@@ -136,8 +138,8 @@ where
     ) -> Option<&RateLimiter<NotKeyed, InMemoryState, DefaultClock>> {
         let task_age = self.get_task_age_seconds(task);
 
-        // Find the next entry larger than the task age, such that task_age <= bucket
-        match self.limiters.range(task_age..).next() {
+        // Find the last entry smaller than the task age, such that bucket < task_age
+        match &self.limiters.range(..task_age).last() {
             Some((_, limiter)) => Some(limiter),
             None => None,
         }
@@ -155,7 +157,8 @@ where
 
         let limiter = self.get_limiter_for_task(task);
         let Some(limiter) = limiter else {
-            bail!("no limiter configured for task {:?}", task)
+            debug!("blocking as ineligible");
+            return Ok(false);
         };
 
         match limiter.check() {
@@ -179,10 +182,10 @@ impl GateEvaluator {
 
             let waiting = self
                 .multiqueue
-                .get_by_state(TaskState::Waiting)
+                .get_by_state(TaskState::Waiting, None)
                 .await
                 .context("couldn't get waiting")?;
-            println!("{} tasks currently waiting", waiting.len());
+            debug!("{} tasks currently waiting", waiting.len());
 
             for task in waiting {
                 let all_gates_proceeding: Result<bool> = self
@@ -193,31 +196,28 @@ impl GateEvaluator {
                         let b = task?;
                         Ok(acc && b)
                     });
+                self.multiqueue.update_evaluation_time(&task).await?;
 
-                // HACK: we "transition" back to `Waiting` (it's current state) if we can't
-                // transition to `Queued` so as to update the timestamp and put at the end of the
-                // line. This could eventually simply update the ts in the unhappy case, rather
-                // than a full (no-op) transition
-                let mut next = TaskState::Waiting;
                 match all_gates_proceeding {
                     Ok(true) => {
-                        println!("{} eligible for transition", &task.name);
-                        next = TaskState::Queued;
+                        debug!("{} eligible for transition", &task.name);
+                        self.multiqueue
+                            .transition(task.clone(), TaskState::Queued)
+                            .await?;
                     }
                     Ok(false) => {
-                        println!(
+                        debug!(
                             "{} ineligible for transition: should not proceed",
                             &task.name
                         );
                     }
                     Err(e) => {
-                        println!(
+                        debug!(
                             "{} couldn't be evaluted for transition: {:?}",
                             &task.name, e,
                         );
                     }
                 }
-                self.multiqueue.transition(task, next).await?;
             }
         }
     }

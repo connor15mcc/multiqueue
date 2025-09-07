@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package multiqueue;
+
+enum TaskState {
+  WAITING = 0;
+  QUEUED = 1;
+  COMPLETE = 2;
+  CANCELLED = 3;
+}
+
+message Task {
+  string name = 1;
+  TaskState state = 2;
+  TaskPriority priority = 4;
+  int64 created_at = 5;
+  int64 last_transitioned = 6;
+  int32 tier = 7;
+
+  enum TaskPriority {
+    LOW = 0;
+    HIGH = 1;
+  }
+}
+
+service MultiqueueAPI {
+  rpc Submit(SubmitTaskRequest) returns (SubmitTaskResponse) {}
+  rpc View(ViewTasksRequest) returns (ViewTasksResponse) {}
+  rpc Cancel(CancelTasksRequest) returns (CancelTasksResponse) {}
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+}
+
+message SubmitTaskRequest {
+  string name = 1;
+  Task.TaskPriority priority = 2;
+  int32 tier = 3;
+}
+message SubmitTaskResponse {
+  oneof response {
+    Task success = 1;
+    Error error = 2;
+  }
+
+  message Error {
+    oneof type {
+      Exists exists = 1;
+    }
+
+    message Exists {}
+  }
+}
+
+message ViewTasksRequest {
+  TaskState state_filter = 1;
+  optional uint32 limit = 2;
+}
+
+message ViewTasksResponse {
+  oneof response {
+    TaskList success = 1;
+    Error error = 2;
+  }
+
+  message TaskList {
+    repeated Task tasks = 1;
+  }
+
+  message Error {
+    string message = 1;
+  }
+}
+
+message CancelTasksRequest {
+  repeated Selector selectors = 1;
+
+  message Selector {
+    oneof selector {
+      string name = 1;
+    }
+  }
+}
+
+message CancelTasksResponse {
+  oneof response {
+    int64 count = 1;
+    Error error = 2;
+  }
+
+  message Error {
+    oneof type {
+      NotFound notfound = 1;
+      Canceled canceled = 2;
+    }
+
+    message NotFound {}
+    message Canceled {}
+  }
+}
+
+message GetStatsRequest {
+  optional int32 tier = 1;
+}
+
+message GetStatsResponse {
+  oneof response {
+    Stats success = 1;
+    Error error = 2;
+  }
+
+  message Stats {
+    int64 waiting_count = 1;
+    int64 queued_count = 2;
+    int64 complete_count = 3;
+    int64 cancelled_count = 4;
+    int64 total_count = 5;
+  }
+
+  message Error {
+    string message = 1;
+  }
+}

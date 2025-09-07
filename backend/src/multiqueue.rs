@@ -22,8 +22,10 @@ impl MultiQueue {
                 state TEXT NOT NULL,
                 worker_id TEXT,
                 priority INTEGER NOT NULL,
+                tier INTEGER NOT NULL,
                 last_evaluated_ts INTEGER NOT NULL,
-                enqueued_time INTEGER NOT NULL
+                last_transitioned INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             )
         "})
         .execute(&pool)
@@ -32,36 +34,44 @@ impl MultiQueue {
         Ok(MultiQueue { pool })
     }
 
-    pub async fn insert(&mut self, tasks: Vec<Task>) -> Result<()> {
+    pub async fn insert(&mut self, tasks: Vec<Task>) -> Result<u64> {
+        let mut count = 0;
         for task in tasks.iter() {
             let result = sqlx::query(indoc! {"
                 INSERT
-                    OR IGNORE INTO tasks (name, state, worker_id, priority, last_evaluated_ts, enqueued_time)
+                    OR IGNORE INTO tasks (name, state, worker_id, priority, tier, last_evaluated_ts, last_transitioned, created_at)
                 VALUES
-                    ($1, $2, $3, $4, unixepoch(), $5)
+                    ($1, $2, $3, $4, $5, unixepoch(), unixepoch(), $6)
                 "})
             .bind(&task.name)
             .bind(&task.state)
             .bind(&task.worker_id)
             .bind(&task.priority)
-            .bind(task.enqueued_time)
+            .bind(task.tier)
+            .bind(task.created_at)
             .execute(&self.pool)
             .await?;
             match result.rows_affected() {
-                0 => println!("{:?} already exists in DB", task),
-                1 => println!("{:?} inserted into DB", task),
+                0 => {}
+                1 => count += 1,
                 _ => unreachable!(),
             }
         }
 
-        Ok(())
+        Ok(count)
     }
 
-    // WARN: this imposes a limit on result size, it is NOT exhaustive
-    pub async fn get_by_state(&mut self, state: TaskState) -> Result<Vec<Task>> {
-        let pending_limit = 5;
+    /// WARN: this imposes a limit on result size, it is NOT exhaustive
+    /// this is sorted by least recently evaluated, perfect for evaluation without starvation
+    pub async fn get_by_state(
+        &mut self,
+        state: TaskState,
+        limit: Option<u32>,
+    ) -> Result<Vec<Task>> {
+        let default_limit = 50;
+        let limit = limit.unwrap_or(default_limit).clamp(1, default_limit);
         let pending: Vec<Task> = sqlx::query_as(indoc! {"
-            SELECT name, state, worker_id, priority, enqueued_time
+            SELECT name, state, worker_id, priority, tier, created_at, last_transitioned
             FROM tasks
             WHERE state = $1
             AND worker_id IS NULL
@@ -69,18 +79,46 @@ impl MultiQueue {
             LIMIT $2
             "})
         .bind(state)
-        .bind(pending_limit)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(pending)
     }
 
-    pub async fn count_with_state(&mut self, state: TaskState) -> Result<u64> {
-        let pending: u64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE state = $1")
-            .bind(state)
-            .fetch_one(&self.pool)
-            .await?;
+    // WARN: this imposes a limit on result size, it is NOT exhaustive
+    /// this is sorted by transition time, perfect for display
+    pub async fn view_by_state(
+        &mut self,
+        state: TaskState,
+        limit: Option<u32>,
+    ) -> Result<Vec<Task>> {
+        let default_limit = 50;
+        let limit = limit.unwrap_or(default_limit).clamp(1, default_limit);
+        let pending: Vec<Task> = sqlx::query_as(indoc! {"
+            SELECT name, state, worker_id, priority, tier, created_at, last_transitioned
+            FROM tasks
+            WHERE state = $1
+            AND worker_id IS NULL
+            ORDER BY priority DESC, last_transitioned DESC
+            LIMIT $2
+            "})
+        .bind(state)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(pending)
+    }
+
+    pub async fn count(&mut self, state: TaskState, tier: Option<Tier>) -> Result<u64> {
+        let pending: u64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE (state = $1 AND (tier = $2 OR $2 IS NULL))",
+        )
+        .bind(state)
+        .bind(tier)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(pending)
     }
@@ -102,7 +140,7 @@ impl MultiQueue {
                 name = $2
                 AND worker_id IS NULL
             RETURNING
-                name, state, worker_id, priority, enqueued_time
+                name, state, worker_id, priority, tier, created_at, last_transitioned
             "})
         .bind(worker_id)
         .bind(task_name)
@@ -129,7 +167,7 @@ impl MultiQueue {
     pub async fn transition(&mut self, task: Task, to: TaskState) -> Result<()> {
         sqlx::query(indoc! {"
             UPDATE tasks
-            SET state = $1, last_evaluated_ts = unixepoch()
+            SET state = $1, last_transitioned = unixepoch()
             WHERE name = $2
             "})
         .bind(to)
@@ -140,7 +178,20 @@ impl MultiQueue {
         Ok(())
     }
 
-    pub async fn cancel_tasks(&mut self, task_names: &[&str]) -> Result<u64> {
+    pub async fn update_evaluation_time(&mut self, task: &Task) -> Result<()> {
+        sqlx::query(indoc! {"
+            UPDATE tasks
+            SET last_evaluated_ts = unixepoch()
+            WHERE name = $1
+            "})
+        .bind(&task.name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn cancel_tasks<S: AsRef<str>>(&mut self, task_names: &[S]) -> Result<u64> {
         if task_names.is_empty() {
             return Ok(0);
         }
@@ -152,12 +203,12 @@ impl MultiQueue {
         for name in task_names {
             let result = sqlx::query(indoc! {"
                 UPDATE tasks
-                SET state = $1, last_evaluated_ts = unixepoch()
+                SET state = $1, last_evaluated_ts = unixepoch(), last_transitioned = unixepoch()
                 WHERE name = $2
                 AND (state = $3 OR state = $4)
                 "})
             .bind(TaskState::Cancelled)
-            .bind(name)
+            .bind(name.as_ref())
             .bind(TaskState::Waiting)
             .bind(TaskState::Queued)
             .execute(&mut *tx)

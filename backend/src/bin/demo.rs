@@ -13,9 +13,9 @@ async fn main() -> Result<()> {
         .enumerate()
         .map(|(i, c)| {
             if (i + 1) % 8 == 0 {
-                Task::with_priority(&c.to_string(), TaskPriority::High)
+                Task::with_priority(c.to_string(), TaskPriority::High).unwrap()
             } else {
-                Task::new(&c.to_string())
+                Task::new(c.to_string()).unwrap()
             }
         })
         .collect();

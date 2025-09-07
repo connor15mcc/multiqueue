@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::time;
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::multiqueue::MultiQueue;
+use crate::{multiqueue::MultiQueue, proto};
 
 #[derive(sqlx::Type, Debug, Clone, PartialEq, Default)]
 #[repr(i32)]
@@ -12,6 +13,38 @@ pub enum TaskPriority {
     High = 1,
 }
 
+impl From<proto::multiqueue::task::TaskPriority> for TaskPriority {
+    fn from(proto: proto::multiqueue::task::TaskPriority) -> Self {
+        use proto::multiqueue::task::TaskPriority;
+
+        match proto {
+            TaskPriority::Low => Self::Low,
+            TaskPriority::High => Self::High,
+        }
+    }
+}
+
+#[derive(sqlx::Type, Debug, Clone, Copy, PartialEq)]
+#[sqlx(transparent)]
+pub struct Tier(i32);
+
+impl Default for Tier {
+    fn default() -> Self {
+        Self(3)
+    }
+}
+
+impl TryFrom<i32> for Tier {
+    type Error = anyhow::Error;
+
+    fn try_from(i: i32) -> Result<Self, Self::Error> {
+        if (0..=3).contains(&i) {
+            return Ok(Self(i));
+        }
+        bail!("invalid tier: {}", i)
+    }
+}
+
 #[derive(sqlx::FromRow, Debug, Clone)]
 pub struct Task {
     #[allow(dead_code)]
@@ -19,41 +52,91 @@ pub struct Task {
     pub state: TaskState,
     pub worker_id: Option<String>,
     pub priority: TaskPriority,
-    pub enqueued_time: i64,
+    pub tier: Tier,
+    pub created_at: i64,
+    pub last_transitioned: i64,
 }
 
-#[derive(sqlx::Type, Debug, Clone, PartialEq)]
+impl TryFrom<proto::multiqueue::SubmitTaskRequest> for Task {
+    type Error = anyhow::Error;
+
+    fn try_from(proto: proto::multiqueue::SubmitTaskRequest) -> Result<Self> {
+        let priority = proto::multiqueue::task::TaskPriority::try_from(proto.priority)
+            .unwrap_or_default()
+            .into();
+        let tier = Tier(proto.tier);
+
+        let t = Task::with_priority_and_tier(proto.name, priority, tier)?;
+        Ok(t)
+    }
+}
+
+impl Into<proto::multiqueue::Task> for Task {
+    fn into(self) -> proto::multiqueue::Task {
+        proto::multiqueue::Task {
+            name: self.name,
+            state: Into::<TaskState>::into(self.state) as i32,
+            priority: Into::<TaskPriority>::into(self.priority) as i32,
+            created_at: self.created_at,
+            last_transitioned: self.last_transitioned,
+            tier: self.tier.0,
+        }
+    }
+}
+
+impl Task {
+    pub fn new(s: String) -> Result<Self> {
+        if s.trim().is_empty() {
+            bail!("cannot have empty task name");
+        }
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        Ok(Task {
+            name: s,
+            state: TaskState::default(),
+            worker_id: None,
+            priority: TaskPriority::default(),
+            tier: Tier::default(),
+            created_at: current_time,
+            last_transitioned: current_time,
+        })
+    }
+
+    pub fn with_priority(s: String, priority: TaskPriority) -> Result<Self> {
+        let mut t = Task::new(s)?;
+        t.priority = priority;
+        Ok(t)
+    }
+
+    pub fn with_priority_and_tier(s: String, priority: TaskPriority, tier: Tier) -> Result<Self> {
+        let mut t = Task::with_priority(s, priority)?;
+        t.tier = tier;
+        Ok(t)
+    }
+}
+
+#[derive(sqlx::Type, Debug, Clone, PartialEq, Default)]
 pub enum TaskState {
+    #[default]
     Waiting,
     Queued,
     Complete,
     Cancelled,
 }
 
-impl Task {
-    pub fn new(s: &str) -> Self {
-        Task {
-            name: s.to_string(),
-            state: TaskState::Waiting,
-            worker_id: None,
-            priority: TaskPriority::default(),
-            enqueued_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-        }
-    }
+impl From<proto::multiqueue::TaskState> for TaskState {
+    fn from(proto: proto::multiqueue::TaskState) -> Self {
+        use proto::multiqueue::TaskState;
 
-    pub fn with_priority(s: &str, priority: TaskPriority) -> Self {
-        Task {
-            name: s.to_string(),
-            state: TaskState::Waiting,
-            worker_id: None,
-            priority,
-            enqueued_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+        match proto {
+            TaskState::Waiting => Self::Waiting,
+            TaskState::Queued => Self::Queued,
+            TaskState::Complete => Self::Complete,
+            TaskState::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -124,7 +207,7 @@ impl TaskRunner {
 
             let queued = self
                 .multiqueue
-                .get_by_state(TaskState::Queued)
+                .get_by_state(TaskState::Queued, None)
                 .await
                 .context("couldn't get enqueued")?;
 
@@ -135,14 +218,14 @@ impl TaskRunner {
                 if let Some(_task_lock) =
                     TaskLock::try_acquire(&task, self.multiqueue.clone(), &self.worker_id).await?
                 {
-                    println!("{} is being completed!", name);
+                    info!("{} is being completed!", name);
 
                     self.multiqueue
                         .transition(task, TaskState::Complete)
                         .await?;
-                    println!("{} transitioned to complete", name);
+                    info!("{} transitioned to complete", name);
                 } else {
-                    println!(
+                    warn!(
                         "Worker {} failed to acquire lock for task {}",
                         self.worker_id, name
                     );
@@ -170,16 +253,10 @@ impl TaskObserver {
         loop {
             interval.tick().await;
 
-            let waiting_count = self.multiqueue.count_with_state(TaskState::Waiting).await?;
-            let queued_count = self.multiqueue.count_with_state(TaskState::Queued).await?;
-            let completed_count = self
-                .multiqueue
-                .count_with_state(TaskState::Complete)
-                .await?;
-            let cancelled_count = self
-                .multiqueue
-                .count_with_state(TaskState::Cancelled)
-                .await?;
+            let waiting_count = self.multiqueue.count(TaskState::Waiting, None).await?;
+            let queued_count = self.multiqueue.count(TaskState::Queued, None).await?;
+            let completed_count = self.multiqueue.count(TaskState::Complete, None).await?;
+            let cancelled_count = self.multiqueue.count(TaskState::Cancelled, None).await?;
             let total_count = waiting_count + queued_count + completed_count + cancelled_count;
 
             if total_count == 0 {
